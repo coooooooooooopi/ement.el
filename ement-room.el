@@ -441,6 +441,11 @@ this one automatically."
   "Face applied to `ement-room-wrap-prefix', which see."
   :group 'ement-room-faces)
 
+(defface ement-room-spoiler
+  '((t (:inherit highlight)))
+  "Face for concealed spoilers."
+  :group 'ement-room-faces)
+
 ;;;;; Options
 
 (defcustom ement-room-ellipsis "⋮"
@@ -4203,6 +4208,167 @@ If FORMATTED-P, return the formatted body content, when available."
       (setf body "[redacted]"))
     body))
 
+(defconst ement-room--spoiler-overwritten-properties
+  '(button button-data category action mouse-action ement-room--spoiler-data follow-link
+           help-echo mouse-face keymap display)
+  "Text properties temporarily overwritten by concealed spoilers.")
+
+(defun ement-room--spoiler-save-properties (beg end)
+  "Return properties Ement will overwrite between BEG and END.
+The returned positions are relative to BEG."
+  (let ((pos beg)
+        saved)
+    (while (< pos end)
+      (let* ((next (next-property-change pos nil end))
+             (properties (text-properties-at pos))
+             kept)
+        (dolist (property ement-room--spoiler-overwritten-properties)
+          (when (plist-member properties property)
+            (setq kept (plist-put kept property (plist-get properties property)))))
+        (when kept
+          (push (list (- pos beg) (- next beg) kept) saved))
+        (setq pos next)))
+    (nreverse saved)))
+
+(defun ement-room--spoiler-restore-properties (beg end saved)
+  "Restore SAVED spoiler properties between BEG and END."
+  (remove-list-of-text-properties beg end ement-room--spoiler-overwritten-properties)
+  (dolist (run saved)
+    (pcase-let* ((`(,relative-beg ,relative-end ,properties) run)
+                 (run-beg (+ beg relative-beg))
+                 (run-end (min end (+ beg relative-end))))
+      (when (< run-beg run-end)
+        (add-text-properties run-beg run-end properties)))))
+
+(defun ement-room--spoiler-mask-line (line reason)
+  "Return a redaction bar for LINE with optional REASON."
+  (let* ((reason (and reason (not (string-empty-p reason)) reason))
+         (reason-width (if reason (string-width reason) 0))
+         (width (max 4 (string-width line) (if reason (+ reason-width 4) 0)))
+         (left (and reason (/ (- width reason-width) 2)))
+         (mask (if reason
+                   (concat (make-string left ?\s) reason
+                           (make-string (- width left reason-width) ?\s))
+                 (make-string width ?\s))))
+    (add-face-text-property 0 (length mask) 'ement-room-spoiler nil mask)
+    (when reason
+      ;; The button face makes the reason visibly actionable while the spoiler face
+      ;; supplies the continuous bar behind it.
+      (add-face-text-property left (+ left (length reason)) '(button bold) nil mask))
+    mask))
+
+(defun ement-room--spoiler-mask (text reason)
+  "Return a redaction bar for spoiler TEXT with optional REASON."
+  (let* ((lines (split-string text "\n" nil))
+         (mask (cons (ement-room--spoiler-mask-line (car lines) reason)
+                     (mapcar (lambda (line)
+                               (ement-room--spoiler-mask-line line nil))
+                             (cdr lines)))))
+    (mapconcat #'identity mask "\n")))
+
+(defun ement-room--conceal-spoiler (beg end saved mask)
+  "Conceal spoiler between BEG and END using SAVED properties and MASK."
+  (let ((inhibit-read-only t))
+    (with-silent-modifications
+      (ement-room--spoiler-restore-properties beg end saved)
+      ;; `button-data' changes the argument passed to a button's action, so an underlying
+      ;; button must not leak its value into the spoiler button.
+      (remove-list-of-text-properties beg end '(button-data))
+      (make-text-button beg end
+                        'action #'ement-room--reveal-spoiler
+                        'mouse-action #'ement-room--reveal-spoiler
+                        'ement-room--spoiler-data (list saved mask 0 (- end beg))
+                        'follow-link t
+                        'help-echo "Reveal spoiler"
+                        'keymap button-map
+                        'mouse-face 'highlight)
+      (put-text-property beg end 'display mask))))
+
+(defun ement-room--hide-spoiler (button)
+  "Hide the spoiler represented by revealed BUTTON."
+  (pcase-let* ((`(,saved ,mask ,offset ,span-length)
+                (button-get button 'ement-room--spoiler-data))
+               (beg (- (button-start button) offset))
+               (end (+ beg span-length)))
+    (ement-room--conceal-spoiler beg end saved mask)))
+
+(defun ement-room--make-rehide-buttons (beg end saved mask)
+  "Make non-button text between BEG and END hide the spoiler again."
+  (let ((pos beg)
+        (span-length (- end beg)))
+    (while (< pos end)
+      (let* ((next (min (next-single-property-change pos 'button nil end)
+                        (next-single-property-change pos 'keymap nil end)))
+             (occupied (or (get-text-property pos 'button)
+                           (get-text-property pos 'keymap))))
+        (unless occupied
+          (make-text-button pos next
+                            'action #'ement-room--hide-spoiler
+                            'ement-room--spoiler-data
+                            (list saved mask (- pos beg) span-length)
+                            'follow-link t
+                            'help-echo "Hide spoiler"))
+        (setq pos next)))))
+
+(defun ement-room--reveal-spoiler (button)
+  "Reveal the spoiler represented by BUTTON."
+  (pcase-let* ((`(,saved ,mask ,_offset ,_span-length)
+                (button-get button 'ement-room--spoiler-data))
+               (beg (button-start button))
+               (end (button-end button))
+               (inhibit-read-only t))
+    (with-silent-modifications
+      (ement-room--spoiler-restore-properties beg end saved)
+      (ement-room--make-rehide-buttons beg end saved mask))))
+
+(declare-function sgml-beginning-of-tag "sgml-mode")
+(declare-function sgml-lexical-context "sgml-mode")
+
+(defun ement-room--normalize-spoiler-attributes ()
+  "Give bare Matrix spoiler attributes an explicit empty value."
+  ;; Emacs omits valueless attributes from the DOM returned by `libxml-parse-html-region',
+  ;; while Matrix explicitly permits this form.  Use the SGML parser to distinguish
+  ;; attributes from occurrences in text or quoted attribute values before normalizing
+  ;; them.
+  (require 'sgml-mode)
+  (let ((case-fold-search t)
+        (attribute "data-mx-spoiler"))
+    (save-excursion
+      (goto-char (point-min))
+      (while (search-forward attribute nil t)
+        (let ((beg (- (point) (length attribute)))
+              (end (point)))
+          (when (and (eq 'tag
+                         (car (save-excursion
+                                (goto-char beg)
+                                (sgml-lexical-context))))
+                     (save-excursion
+                       (goto-char beg)
+                       (equal "span"
+                              (downcase
+                               (or (sgml-beginning-of-tag t) ""))))
+                     (memq (char-before beg) '(?\s ?\t ?\n ?\r ?\f))
+                     (memq (char-after end)
+                           '(?\s ?\t ?\n ?\r ?\f ?/ ?> ?=)))
+            ;; An equals sign may legally follow whitespace after the name.
+            (unless (save-excursion
+                      (goto-char end)
+                      (skip-chars-forward " \t\r\n\f")
+                      (eq (char-after) ?=))
+              (goto-char end)
+              (insert "=\"\""))))))))
+
+(defun ement-room--shr-render-spoiler (dom reason)
+  "Render spoiler span DOM with optional REASON using SHR."
+  (let ((beg (point)))
+    (shr-generic dom)
+    (let ((end (point)))
+      (when (< beg end)
+        (let ((saved (ement-room--spoiler-save-properties beg end))
+              (mask (ement-room--spoiler-mask
+                     (buffer-substring-no-properties beg end) reason)))
+          (ement-room--conceal-spoiler beg end saved mask))))))
+
 (defun ement-room--render-html (string)
   "Return rendered version of HTML STRING.
 HTML is rendered to Emacs text using `shr-insert-document'."
@@ -4215,6 +4381,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
     (erase-buffer)
     (insert string)
     (save-excursion
+      (ement-room--normalize-spoiler-attributes)
       ;; NOTE: We workaround `shr`'s not indenting the blockquote properly (it
       ;; doesn't seem to compensate for the margin).  I don't know exactly how
       ;; `shr-tag-blockquote' and `shr-mark-fill' and `shr-fill-line' and
@@ -4223,17 +4390,25 @@ HTML is rendered to Emacs text using `shr-insert-document'."
       ;; resized (i.e. the wrapping is adjusted automatically by redisplay
       ;; rather than requiring the message to be re-rendered to HTML).
       (let ((shr-use-fonts ement-room-use-variable-pitch)
-            (old-fn (symbol-function 'shr-tag-blockquote))) ;; Bind to a var to avoid unknown-function linting errors.
+            ;; Bind to variables to avoid unknown-function linting errors.
+            (old-blockquote-fn (symbol-function 'shr-tag-blockquote))
+            (old-span-fn (symbol-function 'shr-tag-span)))
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))
-                       (funcall old-fn dom)
+                       (funcall old-blockquote-fn dom)
                        (add-text-properties beg (point-max)
                                             '( wrap-prefix "    "
                                                line-prefix "    "))
                        ;; NOTE: We use our own gv, `ement-text-property'; very convenient.
-                       (add-face-text-property beg (point-max) 'ement-room-quote 'append)))))
+                       (add-face-text-property beg (point-max) 'ement-room-quote 'append))))
+                  ((symbol-function 'shr-tag-span)
+                   (lambda (dom)
+                     (if-let ((spoiler-attribute
+                               (assq 'data-mx-spoiler (dom-attributes dom))))
+                         (ement-room--shr-render-spoiler dom (cdr spoiler-attribute))
+                       (funcall old-span-fn dom)))))
           (shr-insert-document
            (libxml-parse-html-region (point-min) (point-max))))))
     (string-trim (buffer-substring (point) (point-max)))))
@@ -5627,6 +5802,8 @@ Then invalidate EVENT's node to show the image."
 (defvar org-html-inline-images)
 
 (declare-function org-element-property "org-element")
+(declare-function org-element-map "org-element")
+(declare-function org-element-parse-buffer "org-element")
 (declare-function org-export-data "ox")
 (declare-function org-export-get-caption "ox")
 (declare-function org-export-get-ordinal "ox")
@@ -5637,6 +5814,7 @@ Then invalidate EVENT's node to show the image."
 (declare-function org-html--translate "ox-html")
 (declare-function org-html-export-as-html "ox-html")
 (declare-function org-html-format-code "ox-html")
+(declare-function org-link-set-parameters "ol")
 
 (defun ement-room-compose-org ()
   "Activate `org-mode' in current compose buffer.
@@ -5651,6 +5829,44 @@ the Org buffer's contents."
     (org-mode)
     (ement-room-init-compose-buffer room session))
   (setq-local ement-room-send-message-filter #'ement-room-send-org-filter))
+
+(defun ement-room--org-export-spoiler (reason description backend _info)
+  "Export an Org spoiler link with REASON and DESCRIPTION for BACKEND."
+  (if (eq 'html backend)
+      (if (string-empty-p (or reason ""))
+          (format "<span data-mx-spoiler=\"\">%s</span>" (or description ""))
+        (format "<span data-mx-spoiler=\"%s\">%s</span>"
+                (ement--xml-escape-string reason) (or description "")))
+    (or description "")))
+
+(with-eval-after-load 'ol
+  (org-link-set-parameters "spoiler" :export #'ement-room--org-export-spoiler))
+
+(defun ement-room--org-spoiler-fallback (body)
+  "Return BODY with Org spoiler links replaced by non-spoiling labels."
+  (require 'ol)
+  (require 'org-element)
+  (with-temp-buffer
+    (insert body)
+    (let (spoilers)
+      (org-element-map (org-element-parse-buffer) 'link
+        (lambda (link)
+          (when (equal "spoiler" (org-element-property :type link))
+            (push (list (org-element-property :begin link)
+                        (- (org-element-property :end link)
+                           (or (org-element-property :post-blank link) 0))
+                        (org-element-property :path link))
+                  spoilers))))
+      ;; `spoilers' is in reverse document order, so replacing each region does not
+      ;; invalidate the positions of the links that precede it.
+      (dolist (spoiler spoilers)
+        (pcase-let ((`(,beg ,end ,reason) spoiler))
+          (goto-char beg)
+          (delete-region beg end)
+          (insert (if (string-empty-p (or reason ""))
+                      "[Spoiler]"
+                    (format "[Spoiler: %s]" reason)))))
+      (buffer-string))))
 
 (defun ement-room-send-org-filter (content room)
   "Return event CONTENT for ROOM having processed its Org content.
@@ -5680,7 +5896,9 @@ compatibility), and the result is added to the CONTENT as
                     (with-current-buffer "*Org HTML Export*"
                       (prog1 (string-trim (buffer-string))
                         (kill-buffer)))))))
-    (setf (alist-get "formatted_body" content nil nil #'equal) formatted-body
+    (setf (alist-get "body" content nil nil #'equal)
+          (ement-room--org-spoiler-fallback body)
+          (alist-get "formatted_body" content nil nil #'equal) formatted-body
           (alist-get "format" content nil nil #'equal) "org.matrix.custom.html")
     content))
 
